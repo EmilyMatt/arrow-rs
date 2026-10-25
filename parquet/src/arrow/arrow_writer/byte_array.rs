@@ -301,84 +301,31 @@ impl FallbackEncoder {
     }
 }
 
-/// Maximum size of a value that can be inlined in the hash table
-const SHORT_VALUE_LEN: usize = size_of::<u64>() - 1;
+/// Maximum size of a value that is stored inline in its [`Entry`]
+const MAX_INLINE_LEN: usize = size_of::<u64>();
 
 /// Entry in the hash table
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Entry {
-    /// hash of the value (stored to avoid recomputing it in hash table check)
+    /// hash of the value (stored to avoid recomputing it when the table grows)
     hash: u64,
-    /// if len =< [`SHORT_VALUE_LEN`]: the data inlined
-    /// if len > [`SHORT_VALUE_LEN`], the offset of where the data starts
-    offset_or_inline: OffsetOrInlineView,
-    /// value stored by the entry
-    index_in_dict: u64,
+    /// if `len <= MAX_INLINE_LEN`: the value's bytes, zero padded, see [`inline_value`]
+    /// otherwise: the offset of the value's bytes in the dictionary page
+    view: u64,
+    /// length of the value
+    len: u32,
+    /// index of the value in the dictionary
+    index_in_dict: u32,
 }
 
-/// Either offset to the dictionary page bytes or inline bytes when the bytes are short enough
-/// to avoid doing the indirection
+/// Packs a value of at most [`MAX_INLINE_LEN`] bytes into a `u64`
 ///
-/// For inlined view:
-///   +------------+---------------+------------------------------+
-///   | 1 bit set  | len {7 bits}  | value {56 bits}              |
-///   +------------+---------------+------------------------------+
-///
-/// For non-inlined view:
-///   +--------------+--------------------------------------------+
-///   | 1 bit unset  | offset in dict {63 bits}                   |
-///   +--------------+--------------------------------------------+
-///
-/// the inline view contain it's length to avoid having another field for length in the entry
-/// since if the hashes are the same, most probably the length will be the same, so we can do the indirection check
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct OffsetOrInlineView(u64);
-
-impl OffsetOrInlineView {
-    const INLINE_FLAG: u64 = 1 << 63;
-    const LEN_SHIFT: u32 = 56;
-
-    #[inline]
-    fn is_non_inlined(&self) -> bool {
-        (self.0 & Self::INLINE_FLAG) == 0
-    }
-
-    #[inline]
-    fn is_inlined(&self) -> bool {
-        !self.is_non_inlined()
-    }
-
-    #[inline]
-    fn new_inlined(value: &[u8]) -> Self {
-        debug_assert!(value.len() <= 7);
-
-        // Value bytes occupy the low 56 bits, byte 0 in the least significant position
-        let mut buf = [0u8; 8];
-        buf[..value.len()].copy_from_slice(value);
-        let packed = u64::from_le_bytes(buf);
-
-        Self(Self::INLINE_FLAG | ((value.len() as u64) << Self::LEN_SHIFT) | packed)
-    }
-
-    #[inline]
-    fn new_non_inlined(offset: u64) -> Self {
-        assert_eq!(
-            offset & Self::INLINE_FLAG,
-            0,
-            "offset must not have the inlined flag set, we don't support this large of a byte array"
-        );
-        let non_inlined_value = offset;
-        Self(non_inlined_value)
-    }
-
-    fn maybe_non_inlined_value(&self) -> Option<u64> {
-        if self.is_non_inlined() {
-            // Not inlined is when the first bit is unset, so the value
-            Some(self.0)
-        } else {
-            None
-        }
-    }
+/// Values of different lengths can pack to the same `u64`, so the lengths must be compared too
+#[inline]
+fn inline_value(value: &[u8]) -> u64 {
+    let mut buf = [0u8; MAX_INLINE_LEN];
+    buf[..value.len()].copy_from_slice(value);
+    u64::from_le_bytes(buf)
 }
 
 #[derive(Debug, Default)]
@@ -397,75 +344,41 @@ impl ByteArrayInterner {
     fn intern(&mut self, value: &[u8]) -> Result<u64> {
         let hash = self.state.hash_one(value);
 
-        // value is "small" - can be inlined
-        let (found_entry, inline) = if let Some(inline) = maybe_inline_value(value) {
-            // is value is already present in the set?
-            let entry = self.map.find(hash, |header| {
-                // compare value if hashes match
-                if header.hash != hash {
-                    return false;
-                }
-                // value is stored inline so no need to consult buffer
-                // (this is the "small string optimization")
-                inline == header.offset_or_inline
-            });
-
-            (entry, Some(inline))
+        let view = if value.len() <= MAX_INLINE_LEN {
+            let len = value.len() as u32;
+            let inline = inline_value(value);
+            // value is stored inline so no need to consult the page
+            // (this is the "small string optimization")
+            let found = self
+                .map
+                .find(hash, |entry| entry.len == len && entry.view == inline);
+            if let Some(entry) = found {
+                return Ok(entry.index_in_dict as u64);
+            }
+            Some(inline)
         } else {
-            // value is not "small"
-            // Check if the value is already present in the set
-            let entry = self.map.find(hash, |header| {
-                // compare hash
-                if header.hash != hash {
-                    return false;
-                }
-
-                // If the value is not inlined compare it
-                if let Some(offset) = header.offset_or_inline.maybe_non_inlined_value() {
-                    self.is_at(offset, value)
-                } else {
-                    // that value is inline, so it must be different
-                    false
+            let found = self.map.find(hash, |entry| {
+                entry.hash == hash && entry.len as usize == value.len() && {
+                    let offset = entry.view as usize;
+                    // SAFETY: `insert` stored this entry's `len` bytes at `offset`, and the
+                    // page is never truncated
+                    let existing = unsafe { self.page.get_unchecked(offset..offset + value.len()) };
+                    existing == value
                 }
             });
-
-            (entry, None)
+            if let Some(entry) = found {
+                return Ok(entry.index_in_dict as u64);
+            }
+            None
         };
 
-        if let Some(entry) = found_entry {
-            return Ok(entry.index_in_dict);
-        }
-
-        // if no existing entry, make a new one
-        self.insert(value, hash, inline)
+        self.insert(value, hash, view)
     }
 
-    /// Returns whether `value` is in the dictionary page at `offset`
-    #[inline(always)]
-    fn is_at(&self, offset: u64, value: &[u8]) -> bool {
-        let offset = offset as usize;
-        // SAFETY: every value in the page is preceded by its length
-        let stored_len = unsafe { self.page.get_unchecked(offset - 4..offset) };
-        // Rarely false, as the hashes matched, so the branch predicts well and
-        // the comparison's reads issue before the length is known
-        if u32::from_le_bytes(stored_len.try_into().unwrap()) as usize != value.len() {
-            return false;
-        }
-        // SAFETY: the value at `offset` has the length just checked
-        let existing = unsafe { self.page.get_unchecked(offset..offset + value.len()) };
-        existing == value
-    }
-
-    /// Appends `value` to the dictionary, in the empty slot at `pos`
-    fn insert(
-        &mut self,
-        value: &[u8],
-        hash: u64,
-        inline: Option<OffsetOrInlineView>,
-    ) -> Result<u64> {
-        // If inline provided it should inlined
-        debug_assert!(inline.is_none_or(|i| i.is_inlined()));
-
+    /// Appends `value` to the dictionary and returns its index
+    ///
+    /// `inline` is the value's packed bytes if it is short enough to be stored inline
+    fn insert(&mut self, value: &[u8], hash: u64, inline: Option<u64>) -> Result<u64> {
         // The dictionary page is PLAIN encoded, where each value is prefixed by
         // its length as a 4-byte little endian integer so we need to reject that since we use unsafe access later
         //
@@ -488,25 +401,25 @@ impl ByteArrayInterner {
             )));
         }
 
-        let key = self.num_unique_values as u64;
-        let len = value.len();
+        let index_in_dict = u32::try_from(self.num_unique_values)
+            .map_err(|_| general_err!("Too many distinct values in dictionary"))?;
+        let len = value.len() as u32;
 
         self.page.reserve(4 + value.len());
-        self.page.extend_from_slice(&(len as u32).to_le_bytes());
+        self.page.extend_from_slice(&len.to_le_bytes());
         let offset = self.page.len() as u64;
         self.page.extend_from_slice(value);
         self.num_unique_values += 1;
 
-        // Make the new entry
-        let new_header = Entry {
+        let entry = Entry {
             hash,
-            offset_or_inline: inline.unwrap_or_else(|| OffsetOrInlineView::new_non_inlined(offset)),
-            index_in_dict: key,
+            view: inline.unwrap_or(offset),
+            len,
+            index_in_dict,
         };
-        self.map
-            .insert_unique(hash, new_header, |header| header.hash);
+        self.map.insert_unique(hash, entry, |entry| entry.hash);
 
-        Ok(key)
+        Ok(index_in_dict as u64)
     }
 
     fn estimated_memory_size(&self) -> usize {
@@ -637,14 +550,6 @@ impl DictEncoder {
             nan_count: None,
             variable_length_bytes,
         }
-    }
-}
-
-fn maybe_inline_value(value: &[u8]) -> Option<OffsetOrInlineView> {
-    if value.len() <= SHORT_VALUE_LEN {
-        Some(OffsetOrInlineView::new_inlined(value))
-    } else {
-        None
     }
 }
 
